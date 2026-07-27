@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 ### 2. Environment Configuration
 
-Create a `.env` file in your home directory (`/home/sankita/.env`) or local directory:
+Create a `.env` file in your home directory (`/home/ComputerName/.env`) or local directory:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token_here

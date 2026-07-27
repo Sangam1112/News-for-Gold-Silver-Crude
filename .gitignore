@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.us_calendar_tracker_state.json
+*.log
+.DS_Store

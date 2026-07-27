@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+US Economic Calendar Tracker for Crude Oil, Gold, and Silver
+-----------------------------------------------------------
+Tracks high/medium impact US economic events affecting Crude Oil, Gold, and Silver prices.
+Sends Telegram and console notifications:
+  1. Morning Digest (Daily schedule summary in IST)
+  2. 2 Hours Before Event (IST)
+  3. At Event Release Time (IST)
+
+Loads Telegram credentials from /home/sankita/.env automatically.
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import argparse
+import requests
+from datetime import datetime, date, timedelta
+import zoneinfo
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("EconomicCalendarTracker")
+
+# Timezones
+NY_TZ = zoneinfo.ZoneInfo("America/New_York")
+IST_TZ = zoneinfo.ZoneInfo("Asia/Kolkata")
+UTC_TZ = zoneinfo.ZoneInfo("UTC")
+
+# File paths
+ENV_PATH = "/home/sankita/.env"
+STATE_FILE = os.path.expanduser("~/.us_calendar_tracker_state.json")
+
+# Keywords for classification
+CRUDE_KEYWORDS = [
+    "crude", "eia", "distillate", "gasoline", "cushing", "refinery", "opec",
+    "api weekly", "baker hughes", "petroleum", "heating oil", "spr", "oil rig"
+]
+
+METALS_KEYWORDS = [
+    "fomc", "fed interest", "cpi", "consumer price", "ppi", "producer price",
+    "pce", "nonfarm", "non-farm", "unemployment rate", "gdp", "ism",
+    "jobless claims", "retail sales", "powell", "durable goods", "adp employment",
+    "house price", "consumer confidence"
+]
+
+MACRO_HIGH_KEYWORDS = [
+    "fomc", "fed interest", "cpi", "consumer price", "pce", "nonfarm",
+    "gdp", "crude oil inventories", "opec", "unemployment rate"
+]
+
+
+def load_env(env_path=ENV_PATH):
+    """Load environment variables manually from .env file."""
+    env_vars = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_vars[k.strip()] = v.strip().strip("'\"")
+    return env_vars
+
+
+ENV = load_env()
+TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+
+
+def send_telegram_notification(text, parse_mode="Markdown"):
+    """Send alert via Telegram API using credentials from .env."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram token or chat_id missing in .env. Skipping Telegram message.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200 and r.json().get("ok"):
+            logger.info("Telegram notification sent successfully.")
+            return True
+        else:
+            logger.error(f"Telegram API Error: {r.status_code} - {r.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        return False
+
+
+def load_state():
+    """Load alert state to avoid duplicate notifications."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error reading state file: {e}")
+    return {"sent_2h": [], "sent_event": [], "sent_digest": []}
+
+
+def save_state(state):
+    """Save alert state."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving state file: {e}")
+
+
+def categorize_event(event_name):
+    """
+    Categorize event into affected commodities (Crude Oil, Gold, Silver) and impact rating.
+    Returns: (list_of_affected_assets, impact_rating)
+    """
+    name_lower = event_name.lower()
+
+    # Broad macro events that impact USD and all commodities
+    if any(k in name_lower for k in MACRO_HIGH_KEYWORDS):
+        assets = ["Crude Oil", "Gold", "Silver"]
+        impact = "HIGH"
+        return assets, impact
+
+    is_crude = any(k in name_lower for k in CRUDE_KEYWORDS)
+    is_metals = any(k in name_lower for k in METALS_KEYWORDS)
+
+    if is_crude and is_metals:
+        return ["Crude Oil", "Gold", "Silver"], "HIGH"
+    elif is_crude:
+        impact = "HIGH" if any(k in name_lower for k in ["inventories", "opec", "cushing"]) else "MEDIUM"
+        return ["Crude Oil"], impact
+    elif is_metals:
+        impact = "HIGH" if any(k in name_lower for k in ["ppi", "jobless", "durable", "ism", "pce", "adp"]) else "MEDIUM"
+        return ["Gold", "Silver"], impact
+
+    return [], "LOW"
+
+
+def fetch_nasdaq_calendar(target_date_str=None):
+    """
+    Fetch economic events from Nasdaq API for target_date_str (YYYY-MM-DD).
+    Default: today's date in New York.
+    """
+    if not target_date_str:
+        target_date_str = datetime.now(NY_TZ).strftime("%Y-%m-%d")
+
+    url = f"https://api.nasdaq.com/api/calendar/economicevents?date={target_date_str}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            logger.error(f"Nasdaq API HTTP {r.status_code}")
+            return []
+
+        data = r.json()
+        rows = data.get("data", {}).get("rows", []) or []
+        events = []
+
+        for row in rows:
+            country = row.get("country", "")
+            if country in ["United States", "US", "USA"]:
+                event_name = row.get("eventName", "").strip()
+                gmt_time_str = row.get("gmt", "").strip()
+
+                if not event_name or not gmt_time_str:
+                    continue
+
+                # Parse event time (Nasdaq returns time in New York ET)
+                try:
+                    dt_ny = datetime.strptime(f"{target_date_str} {gmt_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=NY_TZ)
+                    dt_ist = dt_ny.astimezone(IST_TZ)
+                except Exception as parse_err:
+                    logger.debug(f"Failed parsing time {gmt_time_str}: {parse_err}")
+                    continue
+
+                assets, impact = categorize_event(event_name)
+                if not assets:
+                    continue
+
+                actual = row.get("actual", "").replace("&nbsp;", "").strip()
+                consensus = row.get("consensus", "").replace("&nbsp;", "").strip()
+                previous = row.get("previous", "").replace("&nbsp;", "").strip()
+
+                # Clean values
+                actual = actual if actual and actual != " " else "Pending"
+                consensus = consensus if consensus and consensus != " " else "N/A"
+                previous = previous if previous and previous != " " else "N/A"
+
+                events.append({
+                    "id": f"{dt_ist.strftime('%Y%m%d_%H%M')}_{event_name.replace(' ', '_')}",
+                    "name": event_name,
+                    "country": country,
+                    "dt_et": dt_ny,
+                    "dt_ist": dt_ist,
+                    "time_ist_str": dt_ist.strftime("%I:%M %p IST"),
+                    "date_ist_str": dt_ist.strftime("%Y-%m-%d"),
+                    "assets": assets,
+                    "impact": impact,
+                    "actual": actual,
+                    "consensus": consensus,
+                    "previous": previous,
+                    "description": row.get("description", "").strip()
+                })
+
+        # Sort events chronologically by IST time
+        events.sort(key=lambda x: x["dt_ist"])
+        return events
+
+    except Exception as e:
+        logger.error(f"Error fetching calendar from Nasdaq: {e}")
+        return []
+
+
+def group_simultaneous_events(events):
+    """
+    Group events that happen at the exact same IST minute into consolidated blocks.
+    """
+    grouped = {}
+    for ev in events:
+        key = (ev["dt_ist"].strftime("%Y-%m-%d %H:%M"), ev["impact"])
+        if key not in grouped:
+            grouped[key] = {
+                "dt_ist": ev["dt_ist"],
+                "time_ist_str": ev["time_ist_str"],
+                "impact": ev["impact"],
+                "assets": set(ev["assets"]),
+                "events": [ev]
+            }
+        else:
+            grouped[key]["events"].append(ev)
+            grouped[key]["assets"].update(ev["assets"])
+
+    # Convert sets to sorted lists
+    result = []
+    for g in grouped.values():
+        g["assets"] = sorted(list(g["assets"]))
+        result.append(g)
+
+    result.sort(key=lambda x: x["dt_ist"])
+    return result
+
+
+def get_market_analysis_note(event_name, assets):
+    """Generate brief commodity impact guidance based on event type."""
+    name_lower = event_name.lower()
+    notes = []
+
+    if "crude oil inventories" in name_lower or "cushing" in name_lower:
+        notes.append("• *Crude Oil:* Drawdown (lower than consensus) = Bullish. Stockpile build = Bearish.")
+    elif "fomc" in name_lower or "fed interest rate" in name_lower:
+        notes.append("• *Gold & Silver:* Hawkish stance/Rate hike = Bullish USD, Bearish Metals. Dovish/Cut = Bullish Metals.")
+        notes.append("• *Crude Oil:* Rate cuts signal economic stimulus (Bullish). High rates slow demand (Bearish).")
+    elif "cpi" in name_lower or "ppi" in name_lower or "pce" in name_lower:
+        notes.append("• *Gold & Silver:* Hotter inflation -> Fed holds/raises rates (Bearish Metals). Cooler inflation -> Rate cuts expected (Bullish Metals).")
+    elif "nonfarm" in name_lower or "unemployment" in name_lower:
+        notes.append("• *Gold & Silver:* Strong jobs data strengthens USD (Bearish Metals). Weak jobs data boosts rate cut odds (Bullish Metals).")
+    elif "gdp" in name_lower or "ism" in name_lower:
+        notes.append("• *All Assets:* Stronger growth boosts Crude demand but can weigh on Gold via USD strength.")
+
+    return "\n".join(notes) if notes else "• *Impact:* Watch for USD volatility influencing Crude, Gold, and Silver prices."
+
+
+def send_daily_digest(events):
+    """Send morning summary of all US events scheduled for today (in IST)."""
+    if not events:
+        logger.info("No major US events for Crude/Metals scheduled today.")
+        return
+
+    today_ist_str = datetime.now(IST_TZ).strftime("%A, %b %d, %Y")
+    grouped = group_simultaneous_events(events)
+
+    msg_lines = [
+        f"📅 *US ECONOMIC CALENDAR DIGEST*",
+        f"🗓 *{today_ist_str} (IST)*",
+        f"Tracking Events affecting: 🛢 *Crude Oil*, 🥇 *Gold*, 🥈 *Silver*",
+        "---------------------------------------------\n"
+    ]
+
+    for g in grouped:
+        impact_icon = "🔴" if g["impact"] == "HIGH" else "🟠"
+        assets_str = ", ".join(g["assets"])
+        msg_lines.append(f"{impact_icon} *{g['time_ist_str']}* [{g['impact']}]")
+        msg_lines.append(f"🎯 *Assets:* {assets_str}")
+
+        for ev in g["events"]:
+            cons_str = f"Cons: {ev['consensus']}" if ev['consensus'] != 'N/A' else ""
+            prev_str = f"Prev: {ev['previous']}" if ev['previous'] != 'N/A' else ""
+            extra = " | ".join(filter(None, [cons_str, prev_str]))
+            extra_formatted = f" ({extra})" if extra else ""
+            msg_lines.append(f"• *{ev['name']}*{extra_formatted}")
+
+        msg_lines.append("")
+
+    msg_lines.append("---------------------------------------------")
+    msg_lines.append("⏰ *Alerts will fire 2 Hours Before & At Event Time in IST.*")
+
+    text = "\n".join(msg_lines)
+    logger.info("Sending Daily Digest...")
+    send_telegram_notification(text)
+
+
+def send_2h_prior_alert(group):
+    """Send alert 2 hours prior to event time in IST."""
+    impact_icon = "🔴" if group["impact"] == "HIGH" else "🟠"
+    assets_str = ", ".join(group["assets"])
+    time_str = group["time_ist_str"]
+
+    msg_lines = [
+        f"⏰ *UPCOMING US EVENT ALERT (IN 2 HOURS)*",
+        f"---------------------------------------------",
+        f"{impact_icon} *Event Time:* `{time_str}` (IST)",
+        f"🎯 *Impacted Assets:* {assets_str}",
+        f"📊 *Impact Level:* {group['impact']}",
+        f"---------------------------------------------",
+        f"*Scheduled Releases:*"
+    ]
+
+    for ev in group["events"]:
+        cons = ev["consensus"]
+        prev = ev["previous"]
+        msg_lines.append(f"• *{ev['name']}*")
+        msg_lines.append(f"   Consensus: `{cons}` | Previous: `{prev}`")
+
+    msg_lines.append("---------------------------------------------")
+    msg_lines.append("*Commodity Impact Guide:*")
+    for ev in group["events"]:
+        guide = get_market_analysis_note(ev["name"], group["assets"])
+        msg_lines.append(guide)
+
+    text = "\n".join(msg_lines)
+    logger.info(f"Sending 2h prior alert for event at {time_str}")
+    send_telegram_notification(text)
+
+
+def send_event_time_alert(group):
+    """Send alert at event release time in IST."""
+    impact_icon = "🚨"
+    assets_str = ", ".join(group["assets"])
+    time_str = group["time_ist_str"]
+
+    msg_lines = [
+        f"🚨 *US ECONOMIC EVENT RELEASING NOW*",
+        f"---------------------------------------------",
+        f"⏰ *Release Time:* `{time_str}` (IST)",
+        f"🎯 *Impacted Assets:* {assets_str}",
+        f"📌 *Impact Level:* {group['impact']}",
+        f"---------------------------------------------",
+        f"*Released Data Details:*"
+    ]
+
+    for ev in group["events"]:
+        actual = ev["actual"]
+        cons = ev["consensus"]
+        prev = ev["previous"]
+        msg_lines.append(f"• *{ev['name']}*")
+        msg_lines.append(f"   Actual: *{actual}* | Cons: `{cons}` | Prev: `{prev}`")
+
+    msg_lines.append("---------------------------------------------")
+    msg_lines.append("💡 *Tip:* Check 1-hour or higher timeframe charts for confirmed market direction after volatility settles.")
+
+    text = "\n".join(msg_lines)
+    logger.info(f"Sending event release alert for event at {time_str}")
+    send_telegram_notification(text)
+
+
+def print_terminal_table(events):
+    """Format and print today's events nicely in terminal."""
+    if not events:
+        print("\nNo major US events for Crude/Metals found for today.\n")
+        return
+
+    now_ist = datetime.now(IST_TZ)
+    print(f"\n==========================================================================================")
+    print(f" US ECONOMIC CALENDAR - CRUDE OIL, GOLD & SILVER (IST TIME)")
+    print(f" Current IST Time: {now_ist.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+    print(f"==========================================================================================")
+    print(f"{'IST Time':<14} {'Impact':<8} {'Affected Assets':<22} {'Event Name':<32} {'Consensus':<10} {'Previous':<10}")
+    print(f"------------------------------------------------------------------------------------------")
+
+    grouped = group_simultaneous_events(events)
+    for g in grouped:
+        time_str = g["time_ist_str"]
+        impact = g["impact"]
+        assets = ", ".join(g["assets"])
+
+        for i, ev in enumerate(g["events"]):
+            t_col = time_str if i == 0 else ""
+            imp_col = impact if i == 0 else ""
+            ast_col = assets if i == 0 else ""
+            print(f"{t_col:<14} {imp_col:<8} {ast_col:<22} {ev['name'][:30]:<32} {ev['consensus']:<10} {ev['previous']:<10}")
+        print(f"------------------------------------------------------------------------------------------")
+    print("\n")
+
+
+def check_and_send_alerts():
+    """Main loop checking if any 2h-prior or event-time alerts are due."""
+    state = load_state()
+    now_ist = datetime.now(IST_TZ)
+    today_str = now_ist.strftime("%Y-%m-%d")
+
+    # Fetch events for today and tomorrow to cover late night / early morning IST shifts
+    events_today = fetch_nasdaq_calendar(today_str)
+    
+    # Tomorrow's NY date
+    tomorrow_ny_str = (datetime.now(NY_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+    events_tomorrow = fetch_nasdaq_calendar(tomorrow_ny_str)
+
+    all_events = events_today + events_tomorrow
+    # Filter unique by event id
+    unique_events = {}
+    for ev in all_events:
+        unique_events[ev["id"]] = ev
+    events_list = list(unique_events.values())
+
+    # Daily digest check (once per day around start/morning)
+    digest_key = f"digest_{today_str}"
+    if digest_key not in state.get("sent_digest", []):
+        send_daily_digest([ev for ev in events_list if ev["date_ist_str"] == today_str])
+        state.setdefault("sent_digest", []).append(digest_key)
+        save_state(state)
+
+    grouped = group_simultaneous_events(events_list)
+
+    for g in grouped:
+        dt_event_ist = g["dt_ist"]
+        dt_2h_prior_ist = dt_event_ist - timedelta(hours=2)
+
+        # Unique key for group
+        group_key = f"{dt_event_ist.strftime('%Y%m%d_%H%M')}_{'_'.join([e['name'][:10] for e in g['events']])}"
+
+        # 1. Check 2 Hours Prior Alert (Window: 2h prior to 1h 45m prior)
+        # Or if now >= 2h prior and now < event_time and not sent yet
+        seconds_to_event = (dt_event_ist - now_ist).total_seconds()
+
+        # 2 Hours prior alert condition:
+        # Event is in future between 1 hour 45 minutes and 2 hours 15 minutes away, or passed 2h mark within last 15 mins
+        if 0 < seconds_to_event <= 7300 and group_key not in state.get("sent_2h", []):
+            send_2h_prior_alert(g)
+            state.setdefault("sent_2h", []).append(group_key)
+            save_state(state)
+
+        # 2. Check Event Release Time Alert
+        # Event time reached within last 15 minutes
+        if -900 <= seconds_to_event <= 180 and group_key not in state.get("sent_event", []):
+            # Refresh latest actual data
+            refreshed_events = fetch_nasdaq_calendar(g["dt_ist"].strftime("%Y-%m-%d"))
+            refreshed_dict = {ev["id"]: ev for ev in refreshed_events}
+            for ev in g["events"]:
+                if ev["id"] in refreshed_dict:
+                    ev["actual"] = refreshed_dict[ev["id"]]["actual"]
+
+            send_event_time_alert(g)
+            state.setdefault("sent_event", []).append(group_key)
+            save_state(state)
+
+
+def run_daemon(poll_interval=60):
+    """Run continuously in daemon mode."""
+    logger.info("Starting US Economic Calendar Tracker Daemon Mode...")
+    logger.info(f"Polling interval: {poll_interval} seconds. Timezone: IST")
+    
+    # Send test telegram verification on daemon launch
+    send_telegram_notification("🚀 *US Economic Calendar Tracker Started*\nMonitoring US events for Crude Oil, Gold & Silver in IST.")
+
+    while True:
+        try:
+            check_and_send_alerts()
+        except Exception as e:
+            logger.error(f"Error in monitoring loop: {e}")
+        time.sleep(poll_interval)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="US Economic Calendar Tracker for Crude Oil, Gold & Silver")
+    parser.add_argument("--today", "--list", action="store_true", help="Print today's scheduled US events in terminal")
+    parser.add_argument("--check", action="store_true", help="Run a single alert check and exit (ideal for cron)")
+    parser.add_argument("--daemon", action="store_true", help="Run in continuous monitoring daemon mode")
+    parser.add_argument("--digest", action="store_true", help="Send today's daily digest to Telegram immediately")
+    parser.add_argument("--test", action="store_true", help="Send a test notification via Telegram")
+    args = parser.parse_args()
+
+    if args.test:
+        print("Sending test notification to Telegram...")
+        res = send_telegram_notification("🧪 *Test Alert*: US Economic Calendar Tracker integration working properly!")
+        print("Result:", "Success" if res else "Failed")
+        return
+
+    if args.today:
+        today_str = datetime.now(IST_TZ).strftime("%Y-%m-%d")
+        events = fetch_nasdaq_calendar(today_str)
+        print_terminal_table(events)
+        return
+
+    if args.digest:
+        today_str = datetime.now(IST_TZ).strftime("%Y-%m-%d")
+        events = fetch_nasdaq_calendar(today_str)
+        send_daily_digest(events)
+        return
+
+    if args.check:
+        logger.info("Performing single check for due economic alerts...")
+        check_and_send_alerts()
+        return
+
+    # Default if no flags passed: run in daemon mode or print today's table then launch daemon
+    today_str = datetime.now(IST_TZ).strftime("%Y-%m-%d")
+    events = fetch_nasdaq_calendar(today_str)
+    print_terminal_table(events)
+    run_daemon(poll_interval=60)
+
+
+if __name__ == "__main__":
+    main()

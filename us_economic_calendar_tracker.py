@@ -165,8 +165,12 @@ CACHE = {}
 CACHE_TTL_SECONDS = 600  # 10 minutes cache TTL
 
 
-def send_telegram_notification(text, parse_mode="Markdown"):
-    """Send alert via Telegram API using credentials from .env."""
+from concurrent.futures import ThreadPoolExecutor
+
+THREAD_POOL = ThreadPoolExecutor(max_workers=4)
+
+
+def _post_telegram_message(text, parse_mode):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram token or chat_id missing in .env. Skipping Telegram message.")
         return False
@@ -191,25 +195,57 @@ def send_telegram_notification(text, parse_mode="Markdown"):
         return False
 
 
+def send_telegram_notification(text, parse_mode="Markdown", async_send=True):
+    """Send alert via Telegram API using non-blocking async thread pool."""
+    if async_send:
+        THREAD_POOL.submit(_post_telegram_message, text, parse_mode)
+        return True
+    else:
+        return _post_telegram_message(text, parse_mode)
+
+
+def prune_state(state, days_to_keep=7):
+    """Prune state keys older than days_to_keep."""
+    cutoff_date = (datetime.now(IST_TZ) - timedelta(days=days_to_keep)).strftime("%Y%m%d")
+    for key in ["sent_1h", "sent_2h", "sent_event"]:
+        if key in state and isinstance(state[key], list):
+            pruned = []
+            for item in state[key]:
+                parts = item.split("_")
+                if parts and len(parts[0]) == 8 and parts[0].isdigit():
+                    if parts[0] >= cutoff_date:
+                        pruned.append(item)
+                else:
+                    pruned.append(item)
+            state[key] = pruned
+
+    if "sent_digest" in state and isinstance(state["sent_digest"], list):
+        cutoff_digest = (datetime.now(IST_TZ) - timedelta(days=days_to_keep)).strftime("%Y-%m-%d")
+        state["sent_digest"] = [d for d in state["sent_digest"] if d.replace("digest_", "") >= cutoff_digest]
+
+    return state
+
+
 def load_state():
-    """Load alert state to avoid duplicate notifications."""
+    """Load alert state to avoid duplicate notifications and prune old entries."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 state = json.load(f)
                 state.setdefault("sent_1h", state.get("sent_2h", []))
-                return state
+                return prune_state(state)
         except Exception as e:
             logger.error(f"Error reading state file: {e}")
     return {"sent_1h": [], "sent_event": [], "sent_digest": []}
 
 
 def save_state(state):
-    """Save alert state atomically using temporary file swap."""
+    """Save alert state atomically using temporary file swap after pruning."""
     try:
+        pruned_state = prune_state(state)
         dir_name = os.path.dirname(STATE_FILE)
         with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False) as tf:
-            json.dump(state, tf, indent=2)
+            json.dump(pruned_state, tf, indent=2)
             temp_name = tf.name
         os.replace(temp_name, STATE_FILE)
     except Exception as e:
@@ -241,9 +277,74 @@ def categorize_event(event_name):
     return [], "LOW"
 
 
+def fetch_tradingview_calendar_fallback(target_date_str):
+    """Fallback fetch economic events from TradingView API if NASDAQ API fails or returns no events."""
+    logger.info(f"Attempting TradingView Calendar Fallback for date: {target_date_str}...")
+    url = f"https://economic-calendar.tradingview.com/events?from={target_date_str}T00:00:00.000Z&to={target_date_str}T23:59:59.000Z"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://www.tradingview.com"
+    }
+
+    try:
+        r = HTTP_SESSION.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            logger.error(f"TradingView Fallback HTTP {r.status_code}")
+            return []
+
+        data = r.json()
+        raw_events = data.get("result", []) or []
+        events = []
+
+        for item in raw_events:
+            country = item.get("country", "")
+            if country in ["US", "United States"]:
+                event_name = item.get("title", "").strip()
+                date_iso = item.get("date", "")
+                if not event_name or not date_iso:
+                    continue
+
+                try:
+                    dt_utc = datetime.fromisoformat(date_iso.replace("Z", "+00:00"))
+                    dt_ny = dt_utc.astimezone(NY_TZ)
+                    dt_ist = dt_utc.astimezone(IST_TZ)
+                except Exception:
+                    continue
+
+                assets, impact = categorize_event(event_name)
+                if not assets:
+                    continue
+
+                actual = str(item.get("actual")) if item.get("actual") is not None else "Pending"
+                consensus = str(item.get("forecast")) if item.get("forecast") is not None else "N/A"
+                previous = str(item.get("previous")) if item.get("previous") is not None else "N/A"
+
+                events.append({
+                    "id": f"{dt_ist.strftime('%Y%m%d_%H%M')}_{event_name.replace(' ', '_')}",
+                    "name": event_name,
+                    "country": "United States",
+                    "dt_et": dt_ny,
+                    "dt_ist": dt_ist,
+                    "time_ist_str": dt_ist.strftime("%I:%M %p IST"),
+                    "date_ist_str": dt_ist.strftime("%Y-%m-%d"),
+                    "assets": assets,
+                    "impact": impact,
+                    "actual": actual,
+                    "consensus": consensus,
+                    "previous": previous,
+                    "description": item.get("commentary", "").strip()
+                })
+
+        return events
+
+    except Exception as e:
+        logger.error(f"Error fetching TradingView fallback calendar: {e}")
+        return []
+
+
 def fetch_nasdaq_calendar(target_date_str=None, force_refresh=False):
     """
-    Fetch economic events from Nasdaq API for target_date_str (YYYY-MM-DD) with smart TTL caching.
+    Fetch economic events from Nasdaq API for target_date_str (YYYY-MM-DD) with smart TTL caching and TradingView fallback.
     """
     if not target_date_str:
         target_date_str = datetime.now(NY_TZ).strftime("%Y-%m-%d")
@@ -264,55 +365,58 @@ def fetch_nasdaq_calendar(target_date_str=None, force_refresh=False):
         r = HTTP_SESSION.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
             logger.error(f"Nasdaq API HTTP {r.status_code}")
-            return CACHE.get(target_date_str, (0, []))[1]
+            events = fetch_tradingview_calendar_fallback(target_date_str)
+        else:
+            data = r.json()
+            rows = data.get("data", {}).get("rows", []) or []
+            events = []
 
-        data = r.json()
-        rows = data.get("data", {}).get("rows", []) or []
-        events = []
+            for row in rows:
+                country = row.get("country", "")
+                if country in ["United States", "US", "USA"]:
+                    event_name = row.get("eventName", "").strip()
+                    gmt_time_str = row.get("gmt", "").strip()
 
-        for row in rows:
-            country = row.get("country", "")
-            if country in ["United States", "US", "USA"]:
-                event_name = row.get("eventName", "").strip()
-                gmt_time_str = row.get("gmt", "").strip()
+                    if not event_name or not gmt_time_str:
+                        continue
 
-                if not event_name or not gmt_time_str:
-                    continue
+                    try:
+                        dt_ny = datetime.strptime(f"{target_date_str} {gmt_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=NY_TZ)
+                        dt_ist = dt_ny.astimezone(IST_TZ)
+                    except Exception as parse_err:
+                        logger.debug(f"Failed parsing time {gmt_time_str}: {parse_err}")
+                        continue
 
-                try:
-                    dt_ny = datetime.strptime(f"{target_date_str} {gmt_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=NY_TZ)
-                    dt_ist = dt_ny.astimezone(IST_TZ)
-                except Exception as parse_err:
-                    logger.debug(f"Failed parsing time {gmt_time_str}: {parse_err}")
-                    continue
+                    assets, impact = categorize_event(event_name)
+                    if not assets:
+                        continue
 
-                assets, impact = categorize_event(event_name)
-                if not assets:
-                    continue
+                    actual = row.get("actual", "").replace("&nbsp;", "").strip()
+                    consensus = row.get("consensus", "").replace("&nbsp;", "").strip()
+                    previous = row.get("previous", "").replace("&nbsp;", "").strip()
 
-                actual = row.get("actual", "").replace("&nbsp;", "").strip()
-                consensus = row.get("consensus", "").replace("&nbsp;", "").strip()
-                previous = row.get("previous", "").replace("&nbsp;", "").strip()
+                    actual = actual if actual and actual != " " else "Pending"
+                    consensus = consensus if consensus and consensus != " " else "N/A"
+                    previous = previous if previous and previous != " " else "N/A"
 
-                actual = actual if actual and actual != " " else "Pending"
-                consensus = consensus if consensus and consensus != " " else "N/A"
-                previous = previous if previous and previous != " " else "N/A"
+                    events.append({
+                        "id": f"{dt_ist.strftime('%Y%m%d_%H%M')}_{event_name.replace(' ', '_')}",
+                        "name": event_name,
+                        "country": country,
+                        "dt_et": dt_ny,
+                        "dt_ist": dt_ist,
+                        "time_ist_str": dt_ist.strftime("%I:%M %p IST"),
+                        "date_ist_str": dt_ist.strftime("%Y-%m-%d"),
+                        "assets": assets,
+                        "impact": impact,
+                        "actual": actual,
+                        "consensus": consensus,
+                        "previous": previous,
+                        "description": row.get("description", "").strip()
+                    })
 
-                events.append({
-                    "id": f"{dt_ist.strftime('%Y%m%d_%H%M')}_{event_name.replace(' ', '_')}",
-                    "name": event_name,
-                    "country": country,
-                    "dt_et": dt_ny,
-                    "dt_ist": dt_ist,
-                    "time_ist_str": dt_ist.strftime("%I:%M %p IST"),
-                    "date_ist_str": dt_ist.strftime("%Y-%m-%d"),
-                    "assets": assets,
-                    "impact": impact,
-                    "actual": actual,
-                    "consensus": consensus,
-                    "previous": previous,
-                    "description": row.get("description", "").strip()
-                })
+        if not events:
+            events = fetch_tradingview_calendar_fallback(target_date_str)
 
         events = inject_fomc_fallback(events, target_date_str)
         events.sort(key=lambda x: x["dt_ist"])
@@ -321,7 +425,11 @@ def fetch_nasdaq_calendar(target_date_str=None, force_refresh=False):
 
     except Exception as e:
         logger.error(f"Error fetching calendar from Nasdaq: {e}")
-        return CACHE.get(target_date_str, (0, []))[1]
+        events = fetch_tradingview_calendar_fallback(target_date_str)
+        events = inject_fomc_fallback(events, target_date_str)
+        events.sort(key=lambda x: x["dt_ist"])
+        CACHE[target_date_str] = (now_ts, events)
+        return events
 
 
 def group_simultaneous_events(events):
@@ -442,6 +550,76 @@ def send_1h_prior_alert(group):
     send_telegram_notification(text)
 
 
+def parse_num(val_str):
+    """Helper to parse float from string like '3.1%', '-2.500M', '201K'."""
+    if not val_str or val_str in ["Pending", "N/A", "Live", "None"]:
+        return None
+    s = str(val_str).replace("%", "").replace(",", "").replace("$", "").strip()
+    mult = 1.0
+    if s.endswith("M"):
+        mult = 1000000.0
+        s = s[:-1]
+    elif s.endswith("K"):
+        mult = 1000.0
+        s = s[:-1]
+    elif s.endswith("B"):
+        mult = 1000000000.0
+        s = s[:-1]
+    try:
+        return float(s) * mult
+    except Exception:
+        return None
+
+
+def calculate_directional_tag(event_name, actual_str, consensus_str, previous_str):
+    """Calculate directional impact (Bullish/Bearish) when actual economic data releases."""
+    actual_num = parse_num(actual_str)
+    if actual_num is None:
+        return ""
+
+    target_num = parse_num(consensus_str)
+    if target_num is None:
+        target_num = parse_num(previous_str)
+    if target_num is None:
+        return ""
+
+    diff = actual_num - target_num
+    if abs(diff) < 1e-6:
+        return " ⚪ *[IN LINE WITH CONSENSUS]*"
+
+    name_lower = event_name.lower()
+
+    # 1. Crude Inventories (EIA, Cushing, API, Distillate, Gasoline)
+    if any(k in name_lower for k in ["crude", "inventory", "inventories", "stockpile", "gasoline", "distillate"]):
+        if diff < 0:
+            return " 🟢 *[BULLISH CRUDE OIL - Inventory Drawdown]*"
+        else:
+            return " 🔴 *[BEARISH CRUDE OIL - Inventory Build]*"
+
+    # 2. Inflation & Rate Indicators (CPI, PCE, PPI)
+    if any(k in name_lower for k in ["cpi", "pce", "ppi", "consumer price", "producer price"]):
+        if diff < 0:
+            return " 🟢 *[BULLISH METALS - Cooler Inflation / Rate Cut Odds ↑]*"
+        else:
+            return " 🔴 *[BEARISH METALS - Hotter Inflation / Fed Hawkish]*"
+
+    # 3. Labor Market (Jobless Claims)
+    if "jobless" in name_lower or "unemployment" in name_lower:
+        if diff > 0:
+            return " 🟢 *[BULLISH METALS - Higher Claims / Dovish Fed]*"
+        else:
+            return " 🔴 *[BEARISH METALS - Lower Claims / Strong Labor]*"
+
+    # 4. Employment / Growth (Nonfarm, ADP, GDP, ISM)
+    if any(k in name_lower for k in ["nonfarm", "adp", "gdp", "ism"]):
+        if diff > 0:
+            return " 🟢 *[BULLISH USD / BULLISH CRUDE]*"
+        else:
+            return " 🟢 *[BULLISH METALS - Weaker Growth]*"
+
+    return ""
+
+
 def send_event_time_alert(group):
     """Send alert at event release time in IST."""
     impact_icon = "🚨"
@@ -462,7 +640,8 @@ def send_event_time_alert(group):
         actual = ev["actual"]
         cons = ev["consensus"]
         prev = ev["previous"]
-        msg_lines.append(f"• *{ev['name']}*")
+        dir_tag = calculate_directional_tag(ev["name"], actual, cons, prev)
+        msg_lines.append(f"• *{ev['name']}*{dir_tag}")
         msg_lines.append(f"   Actual: *{actual}* | Cons: `{cons}` | Prev: `{prev}`")
 
     msg_lines.append("---------------------------------------------")
@@ -548,18 +727,50 @@ def check_and_send_alerts():
             save_state(state)
 
 
+def calculate_adaptive_sleep_seconds(default_poll=60):
+    """Calculate dynamic adaptive sleep duration based on upcoming event proximity."""
+    now_ist = datetime.now(IST_TZ)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    events = fetch_nasdaq_calendar(today_str)
+    if not events:
+        return 300  # 5 minutes if no events today
+
+    upcoming_seconds = []
+    for ev in events:
+        sec = (ev["dt_ist"] - now_ist).total_seconds()
+        if sec >= -180:  # Event is coming up or actively releasing
+            upcoming_seconds.append(sec)
+
+    if not upcoming_seconds:
+        return 300  # 5 minutes idle
+
+    min_sec = min(upcoming_seconds)
+
+    # Within 5 minutes of release (-3 mins to +5 mins): poll fast every 15 seconds
+    if -180 <= min_sec <= 300:
+        return 15
+    # Within 1 hour: poll standard 60 seconds
+    elif min_sec <= 3600:
+        return 60
+    # Farther than 1 hour: poll every 5 minutes (300 seconds)
+    else:
+        return 300
+
+
 def run_daemon(poll_interval=60):
-    """Run continuously in daemon mode."""
-    logger.info("Starting US Economic Calendar Tracker Daemon Mode (Optimized Edition)...")
-    logger.info(f"Polling interval: {poll_interval} seconds. Timezone: IST")
-    send_telegram_notification("🚀 *US Economic Calendar Tracker Started (Optimized)*\nMonitoring US events for Crude Oil, Gold & Silver in IST.")
+    """Run continuously in daemon mode with adaptive polling."""
+    logger.info("Starting US Economic Calendar Tracker Daemon Mode (Adaptive Edition)...")
+    send_telegram_notification("🚀 *US Economic Calendar Tracker Started (Adaptive & Directional)*\nMonitoring US events for Crude Oil, Gold & Silver in IST.")
 
     while True:
         try:
             check_and_send_alerts()
+            sleep_time = calculate_adaptive_sleep_seconds(default_poll=poll_interval)
+            logger.debug(f"Adaptive Polling sleep duration: {sleep_time}s")
         except Exception as e:
             logger.error(f"Error in monitoring loop: {e}")
-        time.sleep(poll_interval)
+            sleep_time = poll_interval
+        time.sleep(sleep_time)
 
 
 def main():

@@ -23,8 +23,17 @@ import tempfile
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import gc
+import ctypes
 from datetime import datetime, date, timedelta
 import zoneinfo
+
+def trim_memory():
+    """Forces glibc memory allocator to return unmapped heap memory back to Linux OS."""
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
 
 # Set up logging
 logging.basicConfig(
@@ -762,9 +771,15 @@ def run_daemon(poll_interval=60):
     logger.info("Starting US Economic Calendar Tracker Daemon Mode (Adaptive Edition)...")
     send_telegram_notification("🚀 *US Economic Calendar Tracker Started (Adaptive & Directional)*\nMonitoring US events for Crude Oil, Gold & Silver in IST.")
 
+    last_gc_time = time.time()
     while True:
         try:
             check_and_send_alerts()
+            now_sec = time.time()
+            if now_sec - last_gc_time >= 900:
+                last_gc_time = now_sec
+                gc.collect()
+                trim_memory()
             sleep_time = calculate_adaptive_sleep_seconds(default_poll=poll_interval)
             logger.debug(f"Adaptive Polling sleep duration: {sleep_time}s")
         except Exception as e:

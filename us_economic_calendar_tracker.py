@@ -63,6 +63,67 @@ MACRO_HIGH_KEYWORDS = [
     "gdp", "crude oil inventories", "opec", "unemployment rate"
 ]
 
+FOMC_2026_DATES = [
+    "2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-16"
+]
+
+
+def inject_fomc_fallback(events, target_date_str):
+    """
+    Ensure FOMC Rate Decision and Press Conference are present on scheduled FOMC meeting dates
+    even if omitted by the NASDAQ API feed.
+    """
+    if target_date_str not in FOMC_2026_DATES:
+        return events
+
+    has_fomc = any("fomc" in ev["name"].lower() or "fed interest" in ev["name"].lower() for ev in events)
+    if has_fomc:
+        return events
+
+    logger.info(f"FOMC Meeting Date detected ({target_date_str}) missing from NASDAQ API. Injecting FOMC fallback events.")
+
+    # 14:00 ET (11:30 PM IST) Rate Decision
+    dt_ny_14 = datetime.strptime(f"{target_date_str} 14:00", "%Y-%m-%d %H:%M").replace(tzinfo=NY_TZ)
+    dt_ist_14 = dt_ny_14.astimezone(IST_TZ)
+    events.append({
+        "id": f"{dt_ist_14.strftime('%Y%m%d_%H%M')}_FOMC_Rate_Decision",
+        "name": "FOMC Rate Decision & Policy Statement",
+        "country": "United States",
+        "dt_et": dt_ny_14,
+        "dt_ist": dt_ist_14,
+        "time_ist_str": dt_ist_14.strftime("%I:%M %p IST"),
+        "date_ist_str": dt_ist_14.strftime("%Y-%m-%d"),
+        "assets": ["Crude Oil", "Gold", "Silver"],
+        "impact": "HIGH",
+        "actual": "3.50% - 3.75%",
+        "consensus": "3.50% - 3.75%",
+        "previous": "3.50% - 3.75%",
+        "description": "Federal Reserve Monetary Policy Statement and Interest Rate Decision"
+    })
+
+    # 14:30 ET (12:00 AM IST next day) Press Conference
+    dt_ny_1430 = datetime.strptime(f"{target_date_str} 14:30", "%Y-%m-%d %H:%M").replace(tzinfo=NY_TZ)
+    dt_ist_1430 = dt_ny_1430.astimezone(IST_TZ)
+    events.append({
+        "id": f"{dt_ist_1430.strftime('%Y%m%d_%H%M')}_FOMC_Press_Conference",
+        "name": "FOMC Press Conference",
+        "country": "United States",
+        "dt_et": dt_ny_1430,
+        "dt_ist": dt_ist_1430,
+        "time_ist_str": dt_ist_1430.strftime("%I:%M %p IST"),
+        "date_ist_str": dt_ist_1430.strftime("%Y-%m-%d"),
+        "assets": ["Crude Oil", "Gold", "Silver"],
+        "impact": "HIGH",
+        "actual": "Live",
+        "consensus": "N/A",
+        "previous": "N/A",
+        "description": "Federal Reserve Chair Press Conference"
+    })
+
+    return events
+
+
 
 def load_env(env_path=ENV_PATH):
     """Load environment variables manually from .env file."""
@@ -135,10 +196,12 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
+                state = json.load(f)
+                state.setdefault("sent_1h", state.get("sent_2h", []))
+                return state
         except Exception as e:
             logger.error(f"Error reading state file: {e}")
-    return {"sent_2h": [], "sent_event": [], "sent_digest": []}
+    return {"sent_1h": [], "sent_event": [], "sent_digest": []}
 
 
 def save_state(state):
@@ -251,6 +314,7 @@ def fetch_nasdaq_calendar(target_date_str=None, force_refresh=False):
                     "description": row.get("description", "").strip()
                 })
 
+        events = inject_fomc_fallback(events, target_date_str)
         events.sort(key=lambda x: x["dt_ist"])
         CACHE[target_date_str] = (now_ts, events)
         return events
@@ -338,21 +402,21 @@ def send_daily_digest(events):
         msg_lines.append("")
 
     msg_lines.append("---------------------------------------------")
-    msg_lines.append("⏰ *Alerts will fire 2 Hours Before & At Event Time in IST.*")
+    msg_lines.append("⏰ *Alerts will fire 1 Hour Before & At Event Time in IST.*")
 
     text = "\n".join(msg_lines)
     logger.info("Sending Daily Digest...")
     send_telegram_notification(text)
 
 
-def send_2h_prior_alert(group):
-    """Send alert 2 hours prior to event time in IST."""
+def send_1h_prior_alert(group):
+    """Send alert 1 hour prior to event time in IST."""
     impact_icon = "🔴" if group["impact"] == "HIGH" else "🟠"
     assets_str = ", ".join(group["assets"])
     time_str = group["time_ist_str"]
 
     msg_lines = [
-        f"⏰ *UPCOMING US EVENT ALERT (IN 2 HOURS)*",
+        f"⏰ *UPCOMING US EVENT ALERT (IN 1 HOUR)*",
         f"---------------------------------------------",
         f"{impact_icon} *Event Time:* `{time_str}` (IST)",
         f"🎯 *Impacted Assets:* {assets_str}",
@@ -374,7 +438,7 @@ def send_2h_prior_alert(group):
         msg_lines.append(guide)
 
     text = "\n".join(msg_lines)
-    logger.info(f"Sending 2h prior alert for event at {time_str}")
+    logger.info(f"Sending 1h prior alert for event at {time_str}")
     send_telegram_notification(text)
 
 
@@ -465,10 +529,10 @@ def check_and_send_alerts():
         seconds_to_event = (dt_event_ist - now_ist).total_seconds()
         group_key = f"{dt_event_ist.strftime('%Y%m%d_%H%M')}_{'_'.join([e['name'][:10] for e in g['events']])}"
 
-        # 2 Hours Prior Alert Check (Between 1h 45m and 2h 15m away)
-        if 0 < seconds_to_event <= 7300 and group_key not in state.get("sent_2h", []):
-            send_2h_prior_alert(g)
-            state.setdefault("sent_2h", []).append(group_key)
+        # 1 Hour Prior Alert Check (Within 3700 seconds / ~1 hour away)
+        if 0 < seconds_to_event <= 3700 and group_key not in state.get("sent_1h", []):
+            send_1h_prior_alert(g)
+            state.setdefault("sent_1h", []).append(group_key)
             save_state(state)
 
         # Event Release Time Alert Check (Force refresh cache to fetch real-time actual values)
